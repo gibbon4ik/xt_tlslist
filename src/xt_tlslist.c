@@ -10,6 +10,7 @@
 #include <linux/tcp.h>
 #include <linux/inet.h>
 #include <asm/errno.h>
+#include <asm/unaligned.h>
 #include <linux/jhash.h>
 #include <linux/spinlock.h>
 #include <linux/proc_fs.h>
@@ -157,21 +158,32 @@ static void htable_destroy(struct tlslist_htable *htable)
 static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 {
 	struct tcphdr *tcp_header;
-	char *data, *tail;
+	u_int8_t *data, *firstbyte;
 	size_t data_len;
 	u_int16_t tls_header_len;
 	u_int8_t handshake_protocol;
 
 	tcp_header = (struct tcphdr *)skb_transport_header(skb);
 	// I'm not completely sure how this works (courtesy of StackOverflow), but it works
-	data = (char *)((unsigned char *)tcp_header + (tcp_header->doff * 4));
-	tail = skb_tail_pointer(skb);
+	data = (u_int8_t *)((unsigned char *)tcp_header + (tcp_header->doff * 4));
 	// Calculate packet data length
-	data_len = (uintptr_t)tail - (uintptr_t)data;
-
-	// If this isn't an TLS handshake, abort
-	if (data[0] != 0x16) {
+	data_len = (uintptr_t)skb_tail_pointer(skb)- (uintptr_t)data;
+	// Abort on zero data length
+	if (data_len + skb->data_len == 0)
 		return EPROTO;
+
+	firstbyte = skb_header_pointer(skb, skb_transport_offset(skb) + (tcp_header->doff * 4), 1, &handshake_protocol);
+	// If this isn't an TLS handshake, abort
+	if (*firstbyte != 0x16)
+		return EPROTO;
+
+	if (skb_is_nonlinear(skb)) {
+		data_len = skb->len - skb_headlen(skb);
+		data = kmalloc(data_len, GFP_ATOMIC);
+		if (data == NULL)
+			return EPROTO;
+		if (skb_copy_bits(skb, skb_headlen(skb), data, data_len))
+			goto nomatch;
 	}
 
 	tls_header_len = (data[3] << 8) + data[4] + 5;
@@ -191,7 +203,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 #ifdef XT_TLS_LIST_DEBUG
 				printk("[xt_tlslist] Data length is to small (%d)\n", (int)data_len);
 #endif
-				return EPROTO;
+				goto nomatch;
 			}
 
 			// Get the length of the session ID
@@ -204,12 +216,11 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 #ifdef XT_TLS_LIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than session_id_len + base_offset +2 (%d > %d)\n", (session_id_len + base_offset + 2), tls_header_len);
 #endif
-				return EPROTO;
+				goto nomatch;
 			}
 
 			// Get the length of the ciphers
-			memcpy(&cipher_len, &data[base_offset + session_id_len + 1], 2);
-			cipher_len = ntohs(cipher_len);
+			cipher_len = get_unaligned_be16(data + base_offset + session_id_len + 1);
 			offset = base_offset + session_id_len + cipher_len + 2;
 #ifdef XT_TLS_LIST_DEBUG
 			printk("[xt_tlslist] Cipher len: %d\n", cipher_len);
@@ -219,7 +230,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 #ifdef XT_TLS_LIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than offset (%d > %d)\n", offset, tls_header_len);
 #endif
-				return EPROTO;
+				goto nomatch;
 			}
 
 			// Get the length of the compression types
@@ -233,12 +244,11 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 #ifdef XT_TLS_LIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than offset w/compression (%d > %d)\n", offset, tls_header_len);
 #endif
-				return EPROTO;
+				goto nomatch;
 			}
 
 			// Get the length of all the extensions
-			memcpy(&extensions_len, &data[offset], 2);
-			extensions_len = ntohs(extensions_len);
+			extensions_len = get_unaligned_be16(data + offset);
 #ifdef XT_TLS_LIST_DEBUG
 			printk("[xt_tlslist] Extensions length: %d\n", extensions_len);
 #endif
@@ -247,7 +257,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 #ifdef XT_TLS_LIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than offset w/extensions (%d > %d)\n", (extensions_len + offset), tls_header_len);
 #endif
-				return EPROTO;
+				goto nomatch;
 			}
 
 			// Loop through all the extensions to find the SNI extension
@@ -255,13 +265,11 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 			{
 				u_int16_t extension_id, extension_len;
 
-				memcpy(&extension_id, &data[offset + extension_offset], 2);
+				extension_id = get_unaligned_be16(data + offset + extension_offset);
 				extension_offset += 2;
 
-				memcpy(&extension_len, &data[offset + extension_offset], 2);
+				extension_len = get_unaligned_be16(data + offset + extension_offset);
 				extension_offset += 2;
-
-				extension_id = ntohs(extension_id), extension_len = ntohs(extension_len);
 
 #ifdef XT_TLS_LIST_DEBUG
 				printk("[xt_tlslist] Extension ID: %d\n", extension_id);
@@ -280,8 +288,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 					name_type = data[offset + extension_offset];
 					extension_offset += 1;
 
-					memcpy(&name_length, &data[offset + extension_offset], 2);
-					name_length = ntohs(name_length);
+					name_length = get_unaligned_be16(data + offset + extension_offset);
 					extension_offset += 2;
 
 #ifdef XT_TLS_LIST_DEBUG
@@ -301,7 +308,9 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 			}
 		}
 	}
-
+nomatch:
+	if (skb_is_nonlinear(skb))
+		kfree(data);
 	return EPROTO;
 }
 
