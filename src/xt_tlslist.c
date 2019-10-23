@@ -15,7 +15,6 @@
 #include <linux/spinlock.h>
 #include <linux/proc_fs.h>
 
-#include "compat.h"
 #include "xt_tlslist.h"
 
 #define TLSLIST_MODULE_VERSION "0.1"
@@ -574,7 +573,7 @@ module_init(tls_mt_init);
 module_exit(tls_mt_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Nils Andreas Svee <nils@stokkdalen.no>");
+MODULE_AUTHOR("Igor Golubev <gibbon4ik@gmail.com>");
 MODULE_DESCRIPTION("Xtables: TLS (SNI) matching");
 MODULE_VERSION(TLSLIST_MODULE_VERSION);
 MODULE_ALIAS("ipt_tlslist");
