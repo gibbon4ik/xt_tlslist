@@ -88,8 +88,7 @@ static struct domains_match* htable_get(struct tlslist_htable *ht, const char *d
 {
         const u_int32_t hash = hash_addr(ht, domain);
 	struct domains_match *dm;
-	struct hlist_node *n;
-        hlist_for_each_entry_safe(dm, n, &ht->hash[hash], node) {
+        hlist_for_each_entry_rcu(dm, &ht->hash[hash], node) {
                 if (strcmp(domain, dm->domain) == 0)
                         return dm;
         }
@@ -100,10 +99,9 @@ static void htable_del(struct tlslist_htable *ht, const char *domain)
 {
         const u_int32_t hash = hash_addr(ht, domain);
 	struct domains_match *dm;
-	struct hlist_node *n;
-        hlist_for_each_entry_safe(dm, n, &ht->hash[hash], node) {
+        hlist_for_each_entry_rcu(dm, &ht->hash[hash], node) {
                 if (strcmp(domain, dm->domain) == 0) {
-                        hlist_del(&dm->node);
+                        hlist_del_rcu(&dm->node);
                         kfree(dm->domain);
                         kfree(dm);
                         ht->ent_count--;
@@ -118,10 +116,9 @@ static void htable_cleanup(struct tlslist_htable *ht)
 
 	for (i = 0; i < ht->size; i++) {
 		struct domains_match *dm;
-		struct hlist_node *n;
 
 		spin_lock(&ht->lock);
-		hlist_for_each_entry_safe(dm, n, &ht->hash[i], node) {
+		hlist_for_each_entry_rcu(dm, &ht->hash[i], node) {
 			hlist_del_rcu(&dm->node);
 			kfree(dm->domain);
 			kfree(dm);
@@ -486,6 +483,7 @@ static int parse_rule(struct tlslist_htable *ht, char *str, size_t size)
 	}
 	++str;
 	--size;
+	spin_lock(&ht->lock);
 	if (add == 1) {
 		htable_add(ht, str);
 	}
@@ -502,6 +500,7 @@ static int parse_rule(struct tlslist_htable *ht, char *str, size_t size)
 			pr_info("found domain %s",dm->domain);
 		}
 	}
+	spin_unlock(&ht->lock);
 	return 0;
 }
 
