@@ -296,10 +296,10 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 					strncpy(*dest, &data[offset + extension_offset], name_length);
 					// Make sure the string is always null-terminated.
 					(*dest)[name_length] = 0;
-
+					if (skb_is_nonlinear(skb))
+						kfree(data);
 					return 0;
 				}
-
 				extension_offset += extension_len;
 			}
 		}
@@ -315,7 +315,7 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	char *parsed_host;
 	const struct xt_tlslist_info *info = par->matchinfo;
 	int result;
-	bool invert = (info->invert & XT_TLS_OP_LIST);
+	bool subdomains = (info->flags & XT_TLSLIST_SUBDOMAINS);
 	bool match;
 
 	if ((result = get_tls_hostname(skb, &parsed_host)) != 0)
@@ -325,10 +325,11 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 
 #ifdef XT_TLS_LIST_DEBUG
 	printk("[xt_tlslist] Parsed domain: %s\n", parsed_host);
-	printk("[xt_tlslist] Domain matches: %s, invert: %s\n", match ? "true" : "false", invert ? "true" : "false");
+	printk("[xt_tlslist] Domain matches: %s\n", match ? "true" : "false");
 #endif
-	if (invert)
-		match = !match;
+	if (!match && subdomains) {
+		// there will be code
+	}
 
 	kfree(parsed_host);
 
