@@ -169,6 +169,8 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 		return EPROTO;
 
 	firstbyte = skb_header_pointer(skb, skb_transport_offset(skb) + (tcp_header->doff * 4), 1, &handshake_protocol);
+	if (!firstbyte)
+		return EPROTO;
 	// If this isn't an TLS handshake, abort
 	if (*firstbyte != 0x16)
 		return EPROTO;
