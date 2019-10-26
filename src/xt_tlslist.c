@@ -339,6 +339,9 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 			}
 			p++;
 		}
+#ifdef XT_TLS_LIST_DEBUG
+	printk("[xt_tlslist] Subdomain matches: %s\n", match ? "true" : "false");
+#endif
 	}
 
 	kfree(parsed_host);
