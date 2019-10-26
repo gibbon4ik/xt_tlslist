@@ -326,7 +326,7 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	match = (htable_get(htable, parsed_host + 1) != NULL);
 
 #ifdef XT_TLS_LIST_DEBUG
-	printk("[xt_tlslist] Parsed domain: %s\n", parsed_host);
+	printk("[xt_tlslist] Parsed domain: %s\n", parsed_host + 1);
 	printk("[xt_tlslist] Domain matches: %s\n", match ? "true" : "false");
 #endif
 	if (!match && subdomains) {
