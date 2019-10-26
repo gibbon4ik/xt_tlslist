@@ -293,11 +293,11 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 					printk("[xt_tlslist] Name type: %d\n", name_type);
 					printk("[xt_tlslist] Name length: %d\n", name_length);
 #endif
-					// Allocate an extra byte for the null-terminator
-					*dest = kmalloc(name_length + 1, GFP_ATOMIC);
-					strncpy(*dest, &data[offset + extension_offset], name_length);
+					// Allocate an extra 2 byte for first dot and the null-terminator
+					*dest = kmalloc(name_length + 2, GFP_ATOMIC);
+					strncpy(*dest + 1, &data[offset + extension_offset], name_length);
 					// Make sure the string is always null-terminated.
-					(*dest)[name_length] = 0;
+					(*dest)[name_length + 1] = 0;
 					if (skb_is_nonlinear(skb))
 						kfree(data);
 					return 0;
@@ -322,15 +322,23 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 
 	if ((result = get_tls_hostname(skb, &parsed_host)) != 0)
 		return false;
-
-	match = (htable_get(htable, parsed_host) != NULL);
+	// first char reserved for dot
+	match = (htable_get(htable, parsed_host + 1) != NULL);
 
 #ifdef XT_TLS_LIST_DEBUG
 	printk("[xt_tlslist] Parsed domain: %s\n", parsed_host);
 	printk("[xt_tlslist] Domain matches: %s\n", match ? "true" : "false");
 #endif
 	if (!match && subdomains) {
-		// there will be code
+		char *p = parsed_host;
+		parsed_host[0] = '.';
+		while (*p) {
+			if (*p == '.') {
+				if ( (match = (htable_get(htable, p) != NULL)) )
+					break;
+			}
+			p++;
+		}
 	}
 
 	kfree(parsed_host);
