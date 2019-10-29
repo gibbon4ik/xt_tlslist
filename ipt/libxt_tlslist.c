@@ -12,7 +12,7 @@ enum {
 static void tlslist_help(void)
 {
 	printf(
-"tls match options:\n --tls-subdomains      Allow subdomains matching for .domain.com\n"
+"tls match options:\n --tls-subdomains      Allow domain and subdomains matching as .domain.com\n"
 	);
 }
 

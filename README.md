@@ -41,19 +41,19 @@ sudo make dkms-install
 You can block traffic to Facebook using the following command.
 
 ```bash
-sudo iptables -A OUTPUT -p tcp --dport 443 -m tlslist --tls-list list -j REJECT --reject-with tcp-reset
+sudo iptables -A OUTPUT -p tcp --dport 443 -m tlslist [--tls-subdomains] -j REJECT --reject-with tcp-reset
 ```
-Then add and delete domains to/from using file /proc/tlslist
+Then add and delete domains to/from using file /proc/tlsdomains
 
 ```bash
-echo "+www.facebook.com" >/proc/tlslist
-echo "-www.facebook.com" >/proc/tlslist
+echo "+www.facebook.com" >/proc/tlsdomains
+echo "-www.facebook.com" >/proc/tlsdomains
 ```
 
 Flush all domains from list
 
 ```bash
-echo "/" >/proc/tlslist
+echo "/" >/proc/tlsdomains
 ```
 
 ## Bugs
@@ -76,16 +76,16 @@ If you've sent a TLS request, you can now use dmesg to see if everything works a
 ```bash
 dmesg
 
-[ 2013.959415] [xt_tls] Session ID length: 32
-[ 2013.974006] [xt_tls] Cipher len: 42
-[ 2013.974292] [xt_tls] Offset (1): 119
-[ 2013.974583] [xt_tls] Compression length: 1
-[ 2013.974915] [xt_tls] Offset (2): 122
-[ 2013.975211] [xt_tls] Extensions length: 38
-[ 2013.977016] [xt_tls] Name type: 0
-[ 2013.977675] [xt_tls] Name length: 10
-[ 2013.978664] [xt_tls] Parsed domain: github.com
-[ 2013.979068] [xt_tls] Domain matches: false, invert: false
+[ 2013.959415] [xt_tlslist] Session ID length: 32
+[ 2013.974006] [xt_tlslist] Cipher len: 42
+[ 2013.974292] [xt_tlslist] Offset (1): 119
+[ 2013.974583] [xt_tlslist] Compression length: 1
+[ 2013.974915] [xt_tlslist] Offset (2): 122
+[ 2013.975211] [xt_tlslist] Extensions length: 38
+[ 2013.977016] [xt_tlslist] Name type: 0
+[ 2013.977675] [xt_tlslist] Name length: 10
+[ 2013.978664] [xt_tlslist] Parsed domain: github.com
+[ 2013.979068] [xt_tlslist] Domain matches: false, invert: false
 ```
 
 ## Credits

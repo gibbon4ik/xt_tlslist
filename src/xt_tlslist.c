@@ -17,7 +17,7 @@
 
 #include "xt_tlslist.h"
 
-#define TLSLIST_MODULE_VERSION "0.1"
+#define TLSLIST_MODULE_VERSION "0.2"
 #define BUFSIZE 4000
 
 static unsigned int hashsize __read_mostly = 10000;
@@ -570,7 +570,7 @@ static struct file_operations proc_ops =
  
 static int __init tls_mt_init (void)
 {
-        procentry = proc_create("tlslist",0660,NULL,&proc_ops);
+        procentry = proc_create("tlsdomains",0660,NULL,&proc_ops);
 	htable_create(&htable);
 	return xt_register_matches(tls_mt_regs, ARRAY_SIZE(tls_mt_regs));
 }
