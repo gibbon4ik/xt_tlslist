@@ -43,10 +43,16 @@ You can block traffic to Facebook using the following command.
 ```bash
 sudo iptables -A OUTPUT -p tcp --dport 443 -m tlslist [--tls-subdomains] -j REJECT --reject-with tcp-reset
 ```
-Then add and delete domains to/from using file /proc/tlsdomains
+
+Then add domain using file /proc/tlsdomains
 
 ```bash
 echo "+www.facebook.com" >/proc/tlsdomains
+```
+
+Delete domain from list
+
+```bash
 echo "-www.facebook.com" >/proc/tlsdomains
 ```
 
@@ -55,6 +61,13 @@ Flush all domains from list
 ```bash
 echo "/" >/proc/tlsdomains
 ```
+Option --tls-subdomains allow block domain with subdomains.
+Adding to list domain ".facebook.com" blocked facebook.com and all subdomains *.facebook.com
+
+```bash
+echo "+.facebook.com" >/proc/tlsdomains
+```
+
 
 ## Bugs
 If you encounter a bug please make sure to include the following things in your bug report:
