@@ -27,6 +27,9 @@ static DEFINE_MUTEX(tlslist_mutex); /* htable lists management */
 
 struct domains_match {
 	char *domain;
+#ifdef XT_TLSLIST_STAT
+	unsigned int counter;
+#endif
 	struct hlist_node node;
 };
 
@@ -76,7 +79,7 @@ static int htable_create(struct tlslist_htable **htable)
 static void htable_add(struct tlslist_htable *ht, const char *domain)
 {
         const u_int32_t hash = hash_addr(ht, domain);
-	struct domains_match *dm = kmalloc(sizeof(struct domains_match), GFP_KERNEL);
+	struct domains_match *dm = kzalloc(sizeof(struct domains_match), GFP_KERNEL);
 	char *str = kmalloc(strlen(domain) + 1, GFP_KERNEL);
 	strcpy(str, domain);
         dm->domain = str;
@@ -198,7 +201,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 			u_int16_t session_id_len, cipher_len, compression_len, extensions_len;
 
 			if (base_offset + 2 > data_len) {
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] Data length is to small (%d)\n", (int)data_len);
 #endif
 				goto nomatch;
@@ -207,11 +210,11 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 			// Get the length of the session ID
 			session_id_len = data[base_offset];
 
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 			printk("[xt_tlslist] Session ID length: %d\n", session_id_len);
 #endif
 			if ((session_id_len + base_offset + 2) > tls_header_len) {
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than session_id_len + base_offset +2 (%d > %d)\n", (session_id_len + base_offset + 2), tls_header_len);
 #endif
 				goto nomatch;
@@ -220,12 +223,12 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 			// Get the length of the ciphers
 			cipher_len = get_unaligned_be16(data + base_offset + session_id_len + 1);
 			offset = base_offset + session_id_len + cipher_len + 2;
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 			printk("[xt_tlslist] Cipher len: %d\n", cipher_len);
 			printk("[xt_tlslist] Offset (1): %d\n", offset);
 #endif
 			if (offset > tls_header_len) {
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than offset (%d > %d)\n", offset, tls_header_len);
 #endif
 				goto nomatch;
@@ -234,12 +237,12 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 			// Get the length of the compression types
 			compression_len = data[offset + 1];
 			offset += compression_len + 2;
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 			printk("[xt_tlslist] Compression length: %d\n", compression_len);
 			printk("[xt_tlslist] Offset (2): %d\n", offset);
 #endif
 			if (offset > tls_header_len) {
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than offset w/compression (%d > %d)\n", offset, tls_header_len);
 #endif
 				goto nomatch;
@@ -247,12 +250,12 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 
 			// Get the length of all the extensions
 			extensions_len = get_unaligned_be16(data + offset);
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 			printk("[xt_tlslist] Extensions length: %d\n", extensions_len);
 #endif
 
 			if ((extensions_len + offset) > tls_header_len) {
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than offset w/extensions (%d > %d)\n", (extensions_len + offset), tls_header_len);
 #endif
 				goto nomatch;
@@ -269,7 +272,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 				extension_len = get_unaligned_be16(data + offset + extension_offset);
 				extension_offset += 2;
 
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] Extension ID: %d\n", extension_id);
 				printk("[xt_tlslist] Extension length: %d\n", extension_len);
 #endif
@@ -289,7 +292,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 					name_length = get_unaligned_be16(data + offset + extension_offset);
 					extension_offset += 2;
 
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 					printk("[xt_tlslist] Name type: %d\n", name_type);
 					printk("[xt_tlslist] Name length: %d\n", name_length);
 #endif
@@ -316,6 +319,7 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 {
 	char *parsed_host;
 	const struct xt_tlslist_info *info = par->matchinfo;
+	struct domains_match *dm;
 	int result;
 	bool subdomains = (info->flags & XT_TLSLIST_SUBDOMAINS);
 	bool match;
@@ -323,9 +327,14 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	if ((result = get_tls_hostname(skb, &parsed_host)) != 0)
 		return false;
 	// first char reserved for dot
-	match = (htable_get(htable, parsed_host + 1) != NULL);
+	dm = htable_get(htable, parsed_host + 1);
+	match = (dm != NULL);
+#ifdef XT_TLSLIST_STAT
+	if (match)
+		dm->counter++;
+#endif
 
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 	printk("[xt_tlslist] Parsed domain: %s\n", parsed_host + 1);
 	printk("[xt_tlslist] Domain matches: %s\n", match ? "true" : "false");
 #endif
@@ -334,12 +343,18 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 		parsed_host[0] = '.';
 		while (*p) {
 			if (*p == '.') {
-				if ( (match = (htable_get(htable, p) != NULL)) )
+				dm = htable_get(htable, p);
+				match = (dm != NULL);
+				if (match) {
+#ifdef XT_TLSLIST_STAT
+					dm->counter++;
+#endif
 					break;
+				}
 			}
 			p++;
 		}
-#ifdef XT_TLS_LIST_DEBUG
+#ifdef XT_TLSLIST_DEBUG
 	printk("[xt_tlslist] Subdomain matches: %s\n", match ? "true" : "false");
 #endif
 	}
@@ -443,7 +458,11 @@ static int tlslist_seq_show(struct seq_file *s, void *v)
 	/* print everything from the bucket at once */
 	if (!hlist_empty(&htable->hash[*curpos])) {
 		hlist_for_each_entry(dm, &htable->hash[*curpos], node) {
+#ifdef XT_TLSLIST_STAT
+			seq_printf(s, "%s %u\n", dm->domain, dm->counter);
+#else
 			seq_printf(s, "%s\n", dm->domain);
+#endif
 		}
 	}
         return 0;
