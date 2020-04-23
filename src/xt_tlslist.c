@@ -258,11 +258,11 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 #ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] TLS header length is smaller than offset w/extensions (%d > %d)\n", (extensions_len + offset), tls_header_len);
 #endif
-				goto nomatch;
+				extensions_len = tls_header_len - offset;
 			}
 
 			// Loop through all the extensions to find the SNI extension
-			while (extension_offset < extensions_len)
+			while (extension_offset + 10 < extensions_len)
 			{
 				u_int16_t extension_id, extension_len;
 
@@ -291,6 +291,13 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 
 					name_length = get_unaligned_be16(data + offset + extension_offset);
 					extension_offset += 2;
+
+					if (extension_offset + name_length > extensions_len) {
+#ifdef XT_TLSLIST_DEBUG
+						printk("[xt_tlslist] Name beyond available data\n");
+#endif
+						goto nomatch;
+					}
 
 #ifdef XT_TLSLIST_DEBUG
 					printk("[xt_tlslist] Name type: %d\n", name_type);
