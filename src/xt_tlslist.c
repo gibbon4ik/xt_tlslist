@@ -17,13 +17,13 @@
 
 #include "xt_tlslist.h"
 
-#define TLSLIST_MODULE_VERSION "0.2"
+#define TLSLIST_MODULE_VERSION "0.3"
 #define BUFSIZE 4000
 
 static unsigned int hashsize __read_mostly = 10000;
 static struct proc_dir_entry *procentry;
 
-static DEFINE_MUTEX(tlslist_mutex); /* htable lists management */
+static DEFINE_MUTEX(domains_mutex); /* domains htable lists management */
 
 struct domains_match {
 	char *domain;
@@ -33,24 +33,24 @@ struct domains_match {
 	struct hlist_node node;
 };
 
-struct tlslist_htable {
+struct domains_htable {
 	spinlock_t lock;		/* write access to hash */
 	unsigned int size;		/* hash array size, set from hashsize */
 	unsigned int ent_count;		/* currently entities */
 	struct hlist_head hash[0];	/* rcu lists array[size] of domain_match'es */
 };
 
-struct tlslist_htable *htable;
+struct domains_htable *domainstable;
 
-static inline u_int32_t hash_addr(const struct tlslist_htable *ht, const char *string)
+static inline u_int32_t hash_addr(const struct domains_htable *ht, const char *string)
 {
     return reciprocal_scale(jhash(string, strlen(string), 0), ht->size);
 }
 
-static int htable_create(struct tlslist_htable **htable)
-	/* rule insertion chain, under tlslist_mutex */
+static int domainstable_create(struct domains_htable **domaintable)
+	/* rule insertion chain, under domains_mutex */
 {
-	struct tlslist_htable *ht;
+	struct domains_htable *ht;
         unsigned int hsize = hashsize; /* (entities) */
 	unsigned int sz; /* (bytes) */
 	int i;
@@ -58,7 +58,7 @@ static int htable_create(struct tlslist_htable **htable)
 	if (hsize > 1000000)
 		hsize = 8192;
 
-	sz = sizeof(struct tlslist_htable) + sizeof(struct hlist_head) * hsize;
+	sz = sizeof(struct domains_htable) + sizeof(struct hlist_head) * hsize;
 	if (sz <= PAGE_SIZE)
 		ht = kzalloc(sz, GFP_KERNEL);
 	else
@@ -72,11 +72,11 @@ static int htable_create(struct tlslist_htable **htable)
 	ht->size = hsize;
 	ht->ent_count = 0;
 	spin_lock_init(&ht->lock);
-	*htable = ht;
+	*domaintable = ht;
 	return 0;
 }
 
-static void htable_add(struct tlslist_htable *ht, const char *domain)
+static void domainstable_add(struct domains_htable *ht, const char *domain)
 {
         const u_int32_t hash = hash_addr(ht, domain);
 	struct domains_match *dm = kzalloc(sizeof(struct domains_match), GFP_KERNEL);
@@ -87,7 +87,7 @@ static void htable_add(struct tlslist_htable *ht, const char *domain)
 	ht->ent_count++;
 }
 
-static struct domains_match* htable_get(struct tlslist_htable *ht, const char *domain)
+static struct domains_match* domainstable_get(struct domains_htable *ht, const char *domain)
 {
         const u_int32_t hash = hash_addr(ht, domain);
 	struct domains_match *dm;
@@ -98,7 +98,7 @@ static struct domains_match* htable_get(struct tlslist_htable *ht, const char *d
         return NULL;
 }
 
-static void htable_del(struct tlslist_htable *ht, const char *domain)
+static void domainstable_del(struct domains_htable *ht, const char *domain)
 {
         const u_int32_t hash = hash_addr(ht, domain);
 	struct domains_match *dm;
@@ -112,8 +112,8 @@ static void htable_del(struct tlslist_htable *ht, const char *domain)
         }
 }
 
-static void htable_cleanup(struct tlslist_htable *ht)
-	/* under tlslist_mutex */
+static void domainstable_cleanup(struct domains_htable *ht)
+	/* under domains_mutex */
 {
 	unsigned int i;
 
@@ -132,19 +132,19 @@ static void htable_cleanup(struct tlslist_htable *ht)
 	}
 }
 
-static void htable_flush(struct tlslist_htable *ht)
+static void domainstable_flush(struct domains_htable *ht)
 {
-	mutex_lock(&tlslist_mutex);
-	htable_cleanup(ht);
-	mutex_unlock(&tlslist_mutex);
+	mutex_lock(&domains_mutex);
+	domainstable_cleanup(ht);
+	mutex_unlock(&domains_mutex);
 }
 
-static void htable_destroy(struct tlslist_htable *htable)
+static void domainstable_destroy(struct domains_htable *ht)
 	/* caller htable_put, iptables rule deletion chain */
 {
-	htable_flush(htable);
-	BUG_ON(htable->ent_count != 0);
-	kvfree(htable);
+	domainstable_flush(ht);
+	BUG_ON(ht->ent_count != 0);
+	kvfree(ht);
 }
 
 /*
@@ -334,7 +334,7 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	if ((result = get_tls_hostname(skb, &parsed_host)) != 0)
 		return false;
 	// first char reserved for dot
-	dm = htable_get(htable, parsed_host + 1);
+	dm = domainstable_get(domainstable, parsed_host + 1);
 	match = (dm != NULL);
 #ifdef XT_TLSLIST_STAT
 	if (match)
@@ -350,7 +350,7 @@ static bool tls_mt(const struct sk_buff *skb, struct xt_action_param *par)
 		parsed_host[0] = '.';
 		while (*p) {
 			if (*p == '.') {
-				dm = htable_get(htable, p);
+				dm = domainstable_get(domainstable, p);
 				match = (dm != NULL);
 				if (match) {
 #ifdef XT_TLSLIST_STAT
@@ -417,12 +417,12 @@ static struct xt_match tls_mt_regs[] __read_mostly = {
 
 static char proc_buf[BUFSIZE];
 
-static void *tlslist_seq_start(struct seq_file *s, loff_t *pos)
+static void *domains_seq_start(struct seq_file *s, loff_t *pos)
 {
         unsigned int *curpos;
 
-	spin_lock(&htable->lock);
-        if (*pos >= htable->size)
+	spin_lock(&domainstable->lock);
+        if (*pos >= domainstable->size)
                 return NULL;
 
         curpos = kmalloc(sizeof(curpos), GFP_ATOMIC);
@@ -433,29 +433,29 @@ static void *tlslist_seq_start(struct seq_file *s, loff_t *pos)
         return curpos;
 }
 
-static void *tlslist_seq_next(struct seq_file *s, void *v, loff_t *pos)
+static void *domains_seq_next(struct seq_file *s, void *v, loff_t *pos)
 {
         unsigned int *curpos = (unsigned int *) v;
 
 	*pos = ++(*curpos);
-        if (*pos >= htable->size) {
+        if (*pos >= domainstable->size) {
 		kfree(v);
                 return NULL;
 	}
         return curpos;
 }
 
-static void tlslist_seq_stop(struct seq_file *s, void *v)
+static void domains_seq_stop(struct seq_file *s, void *v)
 {
 	unsigned int *curpos;
 	curpos = (unsigned int *)v;
 
 	if (!IS_ERR(curpos))
 		kfree(curpos);
-	spin_unlock(&htable->lock);
+	spin_unlock(&domainstable->lock);
 }
 
-static int tlslist_seq_show(struct seq_file *s, void *v)
+static int domains_seq_show(struct seq_file *s, void *v)
 {
 	unsigned int *curpos;
 	struct domains_match *dm;
@@ -463,8 +463,8 @@ static int tlslist_seq_show(struct seq_file *s, void *v)
 	curpos = (unsigned int *)v;
 
 	/* print everything from the bucket at once */
-	if (!hlist_empty(&htable->hash[*curpos])) {
-		hlist_for_each_entry(dm, &htable->hash[*curpos], node) {
+	if (!hlist_empty(&domainstable->hash[*curpos])) {
+		hlist_for_each_entry(dm, &domainstable->hash[*curpos], node) {
 #ifdef XT_TLSLIST_STAT
 			seq_printf(s, "%s %u\n", dm->domain, dm->counter);
 #else
@@ -475,20 +475,20 @@ static int tlslist_seq_show(struct seq_file *s, void *v)
         return 0;
 }
 
-static const struct seq_operations tlslist_seq_ops = {
-        .start      = tlslist_seq_start,
-        .show       = tlslist_seq_show,
-        .next       = tlslist_seq_next,
-        .stop       = tlslist_seq_stop,
+static const struct seq_operations domains_seq_ops = {
+        .start      = domains_seq_start,
+        .show       = domains_seq_show,
+        .next       = domains_seq_next,
+        .stop       = domains_seq_stop,
 };
 
 static int tlslist_proc_open(struct inode *inode, struct file *file)
 {
-        int ret = seq_open(file, &tlslist_seq_ops);
+        int ret = seq_open(file, &domains_seq_ops);
         return ret;
 }
 
-static int parse_rule(struct tlslist_htable *ht, char *str, size_t size)
+static int parse_rule(struct domains_htable *ht, char *str, size_t size)
 {
 	int add;
 
@@ -506,7 +506,7 @@ static int parse_rule(struct tlslist_htable *ht, char *str, size_t size)
 		case '#':
 			return 0;
 		case '/': /* flush table */
-			htable_flush(ht);
+			domainstable_flush(ht);
 			return 0;
 		case '-':
 			add = 0;
@@ -525,13 +525,13 @@ static int parse_rule(struct tlslist_htable *ht, char *str, size_t size)
 	--size;
 	spin_lock(&ht->lock);
 	if (add == 1) {
-		htable_add(ht, str);
+		domainstable_add(ht, str);
 	}
 	else if (add == 0) {
-		htable_del(ht, str);
+		domainstable_del(ht, str);
 	}
 	else if (add == 2) {
-		struct domains_match *dm = htable_get(ht, str);
+		struct domains_match *dm = domainstable_get(ht, str);
 		pr_info("search domain %s", str);
 		if (dm == NULL) {
 			pr_info("domain not found!");
@@ -577,7 +577,7 @@ static ssize_t tlslist_proc_write(struct file *file, const char __user *ubuf, si
                 }
                 *p = '\0';
                 ++p;
-                        if (parse_rule(htable, str, p - str))
+                        if (parse_rule(domainstable, str, p - str))
                             return -EINVAL;
         }
         *pos += p - proc_buf;
@@ -597,14 +597,14 @@ static struct file_operations proc_ops =
 static int __init tls_mt_init (void)
 {
         procentry = proc_create("tlsdomains",0660,NULL,&proc_ops);
-	htable_create(&htable);
+	domainstable_create(&domainstable);
 	return xt_register_matches(tls_mt_regs, ARRAY_SIZE(tls_mt_regs));
 }
 
 static void __exit tls_mt_exit (void)
 {
         proc_remove(procentry);
-	htable_destroy(htable);
+	domainstable_destroy(domainstable);
 	xt_unregister_matches(tls_mt_regs, ARRAY_SIZE(tls_mt_regs));
 }
 
