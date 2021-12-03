@@ -307,7 +307,13 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 					*dest = kmalloc(name_length + 2, GFP_ATOMIC);
 					strncpy(*dest + 1, &data[offset + extension_offset], name_length);
 					// Make sure the string is always null-terminated.
-					(*dest)[name_length + 1] = 0;
+					(*dest)[name_length + 1] = '\0';
+					firstbyte = *(dest + 1);
+					while(*firstbyte) {
+						if (*firstbyte > '@' && *firstbyte < '[')
+							*firstbyte -= 'A' - 'a';
+						firstbyte++;
+					}
 					if (skb_is_nonlinear(skb))
 						kfree(data);
 					return 0;
@@ -616,6 +622,7 @@ MODULE_AUTHOR("Igor Golubev <gibbon4ik@gmail.com>");
 MODULE_DESCRIPTION("Xtables: TLS (SNI) matching");
 MODULE_VERSION(TLSLIST_MODULE_VERSION);
 MODULE_ALIAS("ipt_tlslist");
+MODULE_ALIAS("ip6t_tlslist");
 module_param(hashsize, uint, 0400);
 MODULE_PARM_DESC(hashsize, "default size of hash table used to look up domains");
 

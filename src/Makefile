@@ -1,5 +1,5 @@
 obj-m := xt_tlslist.o
-KERNEL_VERSION := $(shell uname -r)
+KERNEL_VERSION ?= $(shell uname -r)
 IDIR := /lib/modules/$(KERNEL_VERSION)/kernel/net/netfilter/
 KDIR := /lib/modules/$(KERNEL_VERSION)/build
 DESTDIR ?= /
