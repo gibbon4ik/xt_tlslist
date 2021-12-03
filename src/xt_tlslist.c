@@ -308,7 +308,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 					strncpy(*dest + 1, &data[offset + extension_offset], name_length);
 					// Make sure the string is always null-terminated.
 					(*dest)[name_length + 1] = '\0';
-					firstbyte = *(dest + 1);
+					firstbyte = *dest + 1;
 					while(*firstbyte) {
 						if (*firstbyte > '@' && *firstbyte < '[')
 							*firstbyte -= 'A' - 'a';
