@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/skbuff.h>
+#include <linux/netfilter.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter_ipv4/ip_tables.h>
 #include <linux/netfilter_ipv6/ip6_tables.h>
@@ -17,10 +18,14 @@
 
 #include "xt_tlslist.h"
 
-#define TLSLIST_MODULE_VERSION "0.3"
-#define BUFSIZE 4000
+#define TLSLIST_MODULE_VERSION "0.4"
+#define PROCBUFSIZE 4096 /* proc filesystem buffer */
+#define BUFSIZE 600 /* packet buffer size */
+#define MINSIZE 400 /* minimal data size for TLS inspect */
+#define BASE_OFFSET 43 /* offset for session id */
 
 static unsigned int hashsize __read_mostly = 10000;
+static unsigned int conbufcount __read_mostly = 256;
 static struct proc_dir_entry *procentry;
 
 static DEFINE_MUTEX(domains_mutex); /* domains htable lists management */
@@ -34,7 +39,7 @@ struct domains_match {
 };
 
 struct domains_htable {
-	spinlock_t lock;		/* write access to hash */
+	spinlock_t lock;		/* write access to table */
 	unsigned int size;		/* hash array size, set from hashsize */
 	unsigned int ent_count;		/* currently entities */
 	struct hlist_head hash[0];	/* rcu lists array[size] of domain_match'es */
@@ -42,7 +47,71 @@ struct domains_htable {
 
 struct domains_htable *domainstable;
 
-static inline u_int32_t hash_addr(const struct domains_htable *ht, const char *string)
+typedef enum {
+	INACTIVE,
+	ACTIVE
+} bufstates;
+
+struct con_buffer {
+	u_int32_t  key;			/* key calculated from src and dst address and ports */
+	spinlock_t lock;		/* protect buffer changes */
+	bufstates  state;		/* buffer state */
+	u_int32_t  isn;			/* initial sequence number */
+	u_int16_t  len;			/* current data length */
+	u_int8_t   buffer[BUFSIZE];	/* buffer data */
+};
+
+struct con_buffers {
+	u_int32_t size;
+	struct con_buffer *list;
+};
+
+struct con_buffers buffers;
+
+static inline void conbuffer_clear(struct con_buffer *conbuf)
+{
+	spin_lock(&conbuf->lock);
+	conbuf->key = 0;
+	conbuf->state = INACTIVE;
+	conbuf->len = 0;
+	spin_unlock(&conbuf->lock);
+}
+
+static int conbuffers_create(struct con_buffers *buffers)
+{
+        unsigned int size = conbufcount; /* (entities) */
+	unsigned int sz; /* (bytes) */
+	int i;
+	struct con_buffer *list;
+	if (size > 10000)
+		size = 10000;
+
+	sz = sizeof(struct con_buffer) * size;
+	if (sz <= PAGE_SIZE)
+		list = kzalloc(sz, GFP_KERNEL);
+	else
+		list = vzalloc(sz);
+	if (list == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < size; i++) {
+		list[i].key = 0;
+		spin_lock_init(&list[i].lock);
+		list[i].state = INACTIVE;
+		list[i].len = 0;
+	}
+	buffers->size = size;
+	buffers->list = list;
+	return 0;
+}
+
+static inline void conbuffers_destroy(struct con_buffers *buffers)
+	/* caller htable_put, iptables rule deletion chain */
+{
+	kvfree(buffers->list);
+}
+
+static inline u_int32_t domhash_addr(const struct domains_htable *ht, const char *string)
 {
     return reciprocal_scale(jhash(string, strlen(string), 0), ht->size);
 }
@@ -78,7 +147,7 @@ static int domainstable_create(struct domains_htable **domaintable)
 
 static void domainstable_add(struct domains_htable *ht, const char *domain)
 {
-        const u_int32_t hash = hash_addr(ht, domain);
+        const u_int32_t hash = domhash_addr(ht, domain);
 	struct domains_match *dm = kzalloc(sizeof(struct domains_match), GFP_KERNEL);
 	char *str = kmalloc(strlen(domain) + 1, GFP_KERNEL);
 	strcpy(str, domain);
@@ -89,7 +158,7 @@ static void domainstable_add(struct domains_htable *ht, const char *domain)
 
 static struct domains_match* domainstable_get(struct domains_htable *ht, const char *domain)
 {
-        const u_int32_t hash = hash_addr(ht, domain);
+        const u_int32_t hash = domhash_addr(ht, domain);
 	struct domains_match *dm;
         hlist_for_each_entry_rcu(dm, &ht->hash[hash], node) {
                 if (strcmp(domain, dm->domain) == 0)
@@ -100,7 +169,7 @@ static struct domains_match* domainstable_get(struct domains_htable *ht, const c
 
 static void domainstable_del(struct domains_htable *ht, const char *domain)
 {
-        const u_int32_t hash = hash_addr(ht, domain);
+        const u_int32_t hash = domhash_addr(ht, domain);
 	struct domains_match *dm;
         hlist_for_each_entry_rcu(dm, &ht->hash[hash], node) {
                 if (strcmp(domain, dm->domain) == 0) {
@@ -157,32 +226,113 @@ static void domainstable_destroy(struct domains_htable *ht)
 static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 {
 	struct tcphdr *tcp_header;
-	u_int8_t *data, *firstbyte;
+	struct con_buffer *conbuf;
+	u_int8_t *data, *firstbyte, handshake_protocol;
+	u_int16_t tls_header_len, length;
+	u_int32_t hash, index, offset;
 	size_t data_len;
-	u_int16_t tls_header_len;
-	u_int8_t handshake_protocol;
+	u_int8_t freedata = 0;
+	u_int8_t nonlinear = 0;
+	struct iphdr *nh = (struct iphdr *)skb_network_header(skb);
+
+	if (nh->version == 6) {
+		// not implemented yet
+		return EPROTO;
+	}
 
 	tcp_header = (struct tcphdr *)skb_transport_header(skb);
+	hash = jhash_3words(nh->saddr, nh->daddr, (tcp_header->source << 16 | tcp_header->dest), 0);
+	index = reciprocal_scale(hash, buffers.size);
+	conbuf = &buffers.list[index];
+
+	if (tcp_header->syn) {
+		spin_lock(&conbuf->lock);
+		conbuf->key = hash;
+		conbuf->state = ACTIVE;
+		conbuf->len = 0;
+		conbuf->isn = ntohl(tcp_header->seq)+1;
+		spin_unlock(&conbuf->lock);
+		return EPROTO;
+	}
+
+	if (conbuf->key != hash || conbuf->state == INACTIVE)
+		conbuf = NULL;
+
+	if (conbuf != NULL && (tcp_header->fin || tcp_header->rst)) {
+		conbuffer_clear(conbuf);
+		return EPROTO;
+	}
+
 	// I'm not completely sure how this works (courtesy of StackOverflow), but it works
 	data = (u_int8_t *)((unsigned char *)tcp_header + (tcp_header->doff * 4));
 	// Calculate packet data length
-	data_len = (uintptr_t)skb_tail_pointer(skb)- (uintptr_t)data;
+	data_len = (uintptr_t)skb_tail_pointer(skb) - (uintptr_t)data;
+
+#ifdef XT_TLSLIST_DEBUG
+		printk("[xt_tlslist] Packet from %x to %x len %lu hash %d index %d\n", nh->saddr, nh->daddr, data_len+skb->data_len, hash, index);
+#endif
+
 	// Abort on zero data length
 	if (data_len + skb->data_len == 0)
 		return EPROTO;
 
-	firstbyte = skb_header_pointer(skb, skb_transport_offset(skb) + (tcp_header->doff * 4), 1, &handshake_protocol);
-	if (!firstbyte)
-		return EPROTO;
+	if (skb_is_nonlinear(skb))
+		nonlinear = 1;
+
+	if (conbuf != NULL) {
+		offset = ntohl(tcp_header->seq) - conbuf->isn;
+		// data after buffer size
+		if (offset >= BUFSIZE) {
+			conbuffer_clear(conbuf);
+			return EPROTO;
+		}
+
+		if (nonlinear) {
+			data_len = skb->len - skb_headlen(skb);
+			if (offset + data_len > BUFSIZE)
+				data_len = BUFSIZE - offset;
+			if (skb_copy_bits(skb, skb_headlen(skb), &conbuf->buffer[offset], data_len)) {
+				conbuffer_clear(conbuf);
+				goto nomatch;
+			}
+		}
+		else {
+			if (offset + data_len > BUFSIZE)
+				data_len = BUFSIZE - offset;
+			memcpy(&conbuf->buffer[offset], data, data_len);
+		}
+		spin_lock(&conbuf->lock);
+		conbuf->len += data_len;
+		length = conbuf->len;
+		spin_unlock(&conbuf->lock);
+		// not enough data yet
+		if (length < MINSIZE)
+			return EPROTO;
+
+		data = conbuf->buffer;
+		data_len = length;
+		nonlinear = 0;
+	}
+
+	if (nonlinear) {
+		firstbyte = skb_header_pointer(skb, skb_transport_offset(skb) + (tcp_header->doff * 4), 1, &handshake_protocol);
+		if (!firstbyte)
+			return EPROTO;
+	}
+	else {
+		firstbyte = data;
+	}
+
 	// If this isn't an TLS handshake, abort
 	if (*firstbyte != 0x16)
 		return EPROTO;
 
-	if (skb_is_nonlinear(skb)) {
+	if (nonlinear) {
 		data_len = skb->len - skb_headlen(skb);
 		data = kmalloc(data_len, GFP_ATOMIC);
 		if (data == NULL)
 			return EPROTO;
+		freedata = 1;
 		if (skb_copy_bits(skb, skb_headlen(skb), data, data_len))
 			goto nomatch;
 	}
@@ -194,13 +344,13 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 	if (tls_header_len > data_len)
 		tls_header_len = data_len;
 
-	if (tls_header_len > 4) {
+	if (tls_header_len > BASE_OFFSET + 2) {
 		// Check only client hellos for now
 		if (handshake_protocol == 0x01) {
-			u_int offset, base_offset = 43, extension_offset = 2;
+			u_int offset, extension_offset = 2;
 			u_int16_t session_id_len, cipher_len, compression_len, extensions_len;
 
-			if (base_offset + 2 > data_len) {
+			if (BASE_OFFSET + 2 > data_len) {
 #ifdef XT_TLSLIST_DEBUG
 				printk("[xt_tlslist] Data length is to small (%d)\n", (int)data_len);
 #endif
@@ -208,21 +358,21 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 			}
 
 			// Get the length of the session ID
-			session_id_len = data[base_offset];
+			session_id_len = data[BASE_OFFSET];
 
 #ifdef XT_TLSLIST_DEBUG
 			printk("[xt_tlslist] Session ID length: %d\n", session_id_len);
 #endif
-			if ((session_id_len + base_offset + 2) > tls_header_len) {
+			if ((session_id_len + BASE_OFFSET + 2) > tls_header_len) {
 #ifdef XT_TLSLIST_DEBUG
-				printk("[xt_tlslist] TLS header length is smaller than session_id_len + base_offset +2 (%d > %d)\n", (session_id_len + base_offset + 2), tls_header_len);
+				printk("[xt_tlslist] TLS header length is smaller than session_id_len + BASE_OFFSET +2 (%d > %d)\n", (session_id_len + BASE_OFFSET + 2), tls_header_len);
 #endif
 				goto nomatch;
 			}
 
 			// Get the length of the ciphers
-			cipher_len = get_unaligned_be16(data + base_offset + session_id_len + 1);
-			offset = base_offset + session_id_len + cipher_len + 2;
+			cipher_len = get_unaligned_be16(data + BASE_OFFSET + session_id_len + 1);
+			offset = BASE_OFFSET + session_id_len + cipher_len + 2;
 #ifdef XT_TLSLIST_DEBUG
 			printk("[xt_tlslist] Cipher len: %d\n", cipher_len);
 			printk("[xt_tlslist] Offset (1): %d\n", offset);
@@ -303,18 +453,20 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 					printk("[xt_tlslist] Name type: %d\n", name_type);
 					printk("[xt_tlslist] Name length: %d\n", name_length);
 #endif
+					if (conbuf != NULL)
+						conbuffer_clear(conbuf);
 					// Allocate an extra 2 byte for first dot and the null-terminator
 					*dest = kmalloc(name_length + 2, GFP_ATOMIC);
 					strncpy(*dest + 1, &data[offset + extension_offset], name_length);
 					// Make sure the string is always null-terminated.
 					(*dest)[name_length + 1] = '\0';
 					firstbyte = *dest + 1;
-					while(*firstbyte) {
+					while (*firstbyte) {
 						if (*firstbyte > '@' && *firstbyte < '[')
 							*firstbyte -= 'A' - 'a';
 						firstbyte++;
 					}
-					if (skb_is_nonlinear(skb))
+					if (nonlinear)
 						kfree(data);
 					return 0;
 				}
@@ -323,7 +475,7 @@ static int get_tls_hostname(const struct sk_buff *skb, char **dest)
 		}
 	}
 nomatch:
-	if (skb_is_nonlinear(skb))
+	if (freedata)
 		kfree(data);
 	return EPROTO;
 }
@@ -421,7 +573,7 @@ static struct xt_match tls_mt_regs[] __read_mostly = {
 #endif
 };
 
-static char proc_buf[BUFSIZE];
+static char proc_buf[PROCBUFSIZE];
 
 static void *domains_seq_start(struct seq_file *s, loff_t *pos)
 {
@@ -604,12 +756,14 @@ static int __init tls_mt_init (void)
 {
         procentry = proc_create("tlsdomains",0660,NULL,&proc_ops);
 	domainstable_create(&domainstable);
+	conbuffers_create(&buffers);
 	return xt_register_matches(tls_mt_regs, ARRAY_SIZE(tls_mt_regs));
 }
 
 static void __exit tls_mt_exit (void)
 {
         proc_remove(procentry);
+	conbuffers_destroy(&buffers);
 	domainstable_destroy(domainstable);
 	xt_unregister_matches(tls_mt_regs, ARRAY_SIZE(tls_mt_regs));
 }
@@ -625,4 +779,6 @@ MODULE_ALIAS("ipt_tlslist");
 MODULE_ALIAS("ip6t_tlslist");
 module_param(hashsize, uint, 0400);
 MODULE_PARM_DESC(hashsize, "default size of hash table used to look up domains");
+module_param(conbufcount, uint, 0400);
+MODULE_PARM_DESC(conbufcount, "number of buffers used to store connections data");
 
