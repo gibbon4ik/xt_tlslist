@@ -25,7 +25,7 @@
 #define BASE_OFFSET 43 /* offset for session id */
 
 static unsigned int hashsize __read_mostly = 10000;
-static unsigned int conbufcount __read_mostly = 256;
+static unsigned int conbufcount __read_mostly = 512;
 static struct proc_dir_entry *procentry;
 
 static DEFINE_MUTEX(domains_mutex); /* domains htable lists management */
